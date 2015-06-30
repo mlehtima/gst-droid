@@ -50,7 +50,7 @@ static GstStaticPadTemplate vf_src_template_factory =
 GST_STATIC_PAD_TEMPLATE (GST_BASE_CAMERA_SRC_VIEWFINDER_PAD_NAME,
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE_WITH_FEATURES
+    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE_WITH_FEATURES_METADATA
         (GST_CAPS_FEATURE_MEMORY_DROID_MEDIA_BUFFER, "{YV12}")));
 
 static GstStaticPadTemplate img_src_template_factory =
@@ -63,7 +63,7 @@ static GstStaticPadTemplate vid_src_template_factory =
 GST_STATIC_PAD_TEMPLATE (GST_BASE_CAMERA_SRC_VIDEO_PAD_NAME,
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE_WITH_FEATURES
+    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE_WITH_FEATURES_METADATA
         (GST_CAPS_FEATURE_MEMORY_DROID_VIDEO_META_DATA, "{YV12}")));
 
 static gboolean gst_droidcamsrc_pad_activate_mode (GstPad * pad,
@@ -1580,6 +1580,10 @@ gst_droidcamsrc_vidsrc_negotiate (GstDroidCamSrcPad * data)
    */
   gst_structure_fixate_field_nearest_fraction (gst_caps_get_structure (our_caps,
           0), "framerate", G_MAXINT, 1);
+
+  bool metadata =
+      droid_media_camera_store_meta_data_in_buffers (src->dev->cam, true);
+  gst_caps_set_simple (our_caps, "metadata", G_TYPE_BOOLEAN, metadata, NULL);
 
   if (!gst_pad_set_caps (data->pad, our_caps)) {
     GST_ERROR_OBJECT (src, "failed to set caps");

@@ -30,6 +30,14 @@ G_BEGIN_DECLS
 #define GST_ALLOCATOR_WRAPPED_MEMORY                    "WrappedMemory"
 #define GST_CAPS_FEATURE_MEMORY_DROID_VIDEO_META_DATA   "memory:DroidVideoMetaData"
 
+#define GST_VIDEO_CAPS_MAKE_WITH_FEATURES_METADATA(features,format) \
+"video/x-raw(" features "), " \
+"format = (string) " format ", " \
+"width = " GST_VIDEO_SIZE_RANGE ", " \
+"height = " GST_VIDEO_SIZE_RANGE ", " \
+"framerate = " GST_VIDEO_FPS_RANGE ", " \
+"metadata = (boolean) { FALSE, TRUE }"
+
 GstAllocator * gst_wrapped_memory_allocator_new (void);
 
 gboolean       gst_is_wrapped_memory_memory (GstMemory * mem);

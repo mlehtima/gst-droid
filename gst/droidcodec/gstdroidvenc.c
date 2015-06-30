@@ -40,7 +40,7 @@ static GstStaticPadTemplate gst_droidvenc_sink_template_factory =
 GST_STATIC_PAD_TEMPLATE (GST_VIDEO_ENCODER_SINK_NAME,
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE_WITH_FEATURES
+    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE_WITH_FEATURES_METADATA
         (GST_CAPS_FEATURE_MEMORY_DROID_VIDEO_META_DATA, "{YV12}")));
 
 enum
@@ -140,8 +140,8 @@ gst_droidvenc_create_codec (GstDroidVEnc * enc)
   md.stride = enc->in_state->info.width;
   md.slice_height = enc->in_state->info.height;
 
-  /* TODO: get this from caps */
-  md.meta_data = true;
+  gst_structure_get_boolean (gst_caps_get_structure (enc->in_state->caps, 0),
+      "metadata", &md.meta_data);
 
   query = gst_droid_query_new_video_color_format ();
   if (!gst_pad_peer_query (GST_VIDEO_ENCODER_SINK_PAD (GST_VIDEO_ENCODER (enc)),

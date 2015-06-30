@@ -823,12 +823,6 @@ gst_droidcamsrc_dev_start_video_recording (GstDroidCamSrcDev * dev)
   dev->vid->video_frames = 0;
   dev->vid->queued_frames = 0;
 
-  /* TODO: get that from caps */
-  if (!droid_media_camera_store_meta_data_in_buffers (dev->cam, true)) {
-    GST_ERROR ("error storing meta data in buffers for video recording");
-    goto out;
-  }
-
   if (!droid_media_camera_start_recording (dev->cam)) {
     GST_ERROR ("error starting video recording");
     goto out;
