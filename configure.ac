@@ -64,6 +64,17 @@ PKG_CHECK_MODULES(GST, [
   ])
 ])
 
+PKG_CHECK_MODULES(GSTPB, [
+  gstreamer-pbutils-1.0 >= $GST_REQUIRED
+], [
+  AC_SUBST(GSTPB_CFLAGS)
+  AC_SUBST(GSTPB_LIBS)
+], [
+  AC_MSG_ERROR([
+      gstreamer-pbutils-1.0 not found
+  ])
+])
+
 PKG_CHECK_MODULES(CHECK, [
   gstreamer-check-1.0 >= $GST_REQUIRED
 ], [
@@ -166,7 +177,6 @@ AC_CONFIG_FILES([Makefile
 		gst/droideglsink/Makefile
 		gst/droidcodec/Makefile
 		gst/droidcamsrc/Makefile
-		tools/Makefile
-		tools/mk-cam-conf/Makefile])
+		tools/Makefile])
 AC_OUTPUT
 

@@ -47,11 +47,12 @@ GST_DEBUG_CATEGORY_EXTERN (gst_droid_camsrc_debug);
 #define GST_CAT_DEFAULT gst_droid_camsrc_debug
 
 static GstStaticPadTemplate vf_src_template_factory =
-GST_STATIC_PAD_TEMPLATE (GST_BASE_CAMERA_SRC_VIEWFINDER_PAD_NAME,
+    GST_STATIC_PAD_TEMPLATE (GST_BASE_CAMERA_SRC_VIEWFINDER_PAD_NAME,
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE_WITH_FEATURES_METADATA
-        (GST_CAPS_FEATURE_MEMORY_DROID_MEDIA_BUFFER, "{YV12}")));
+        (GST_CAPS_FEATURE_MEMORY_DROID_MEDIA_BUFFER, "{YV12}") ";"
+        GST_VIDEO_CAPS_MAKE ("{NV21}")));
 
 static GstStaticPadTemplate img_src_template_factory =
 GST_STATIC_PAD_TEMPLATE (GST_BASE_CAMERA_SRC_IMAGE_PAD_NAME,
@@ -83,6 +84,8 @@ static void gst_droidcamsrc_add_vfsrc_orientation_tag (GstDroidCamSrc * src);
 static gboolean gst_droidcamsrc_select_and_activate_mode (GstDroidCamSrc * src);
 static GstCaps *gst_droidcamsrc_pick_largest_resolution (GstDroidCamSrc * src,
     GstCaps * caps);
+static gchar *gst_droidcamsrc_find_picture_resolution (GstDroidCamSrc * src,
+    const gchar * resolution);
 
 enum
 {
@@ -170,7 +173,7 @@ gst_droidcamsrc_init (GstDroidCamSrc * src)
   src->fps_n = 0;
   src->fps_d = 1;
 
-  gst_droidcamsrc_photography_init (src);
+  gst_droidcamsrc_photography_init (src, DEFAULT_CAMERA_DEVICE);
 
   src->vfsrc = gst_droidcamsrc_create_pad (src,
       &vf_src_template_factory, GST_BASE_CAMERA_SRC_VIEWFINDER_PAD_NAME, FALSE);
@@ -204,6 +207,13 @@ gst_droidcamsrc_get_property (GObject * object, guint prop_id, GValue * value,
   }
 
   switch (prop_id) {
+    case PROP_DEVICE_PARAMETERS:
+      g_rec_mutex_lock (&src->dev_lock);
+      g_value_set_pointer (value, src->dev
+          && src->dev->params ? src->dev->params->params : NULL);
+      g_rec_mutex_unlock (&src->dev_lock);
+      break;
+
     case PROP_CAMERA_DEVICE:
       g_value_set_enum (value, src->camera_device);
       break;
@@ -271,7 +281,9 @@ gst_droidcamsrc_set_property (GObject * object, guint prop_id,
             "cannot change camera-device while camera is running");
       } else {
         src->camera_device = g_value_get_enum (value);
-        GST_DEBUG_OBJECT (src, "camera device set to %d", src->camera_device);
+        GST_INFO_OBJECT (src, "camera device set to %d", src->camera_device);
+        /* load our configuration file */
+        gst_droidcamsrc_photography_init (src, src->camera_device);
       }
       g_rec_mutex_unlock (&src->dev_lock);
       break;
@@ -940,6 +952,11 @@ gst_droidcamsrc_class_init (GstDroidCamSrcClass * klass)
           0, 270, DEFAULT_SENSOR_ORIENTATION,
           G_PARAM_READABLE | G_PARAM_STATIC_STRINGS | G_PARAM_DEPRECATED));
 
+  g_object_class_install_property (gobject_class, PROP_DEVICE_PARAMETERS,
+      g_param_spec_pointer ("device-parameters", "Device parameters",
+          "The GHash table of the GstDroidCamSrcParams struct currently used",
+          G_PARAM_READABLE | G_PARAM_STATIC_STRINGS | G_PARAM_PRIVATE));
+
   gst_droidcamsrc_photography_add_overrides (gobject_class);
 
   /* Signals */
@@ -1438,11 +1455,19 @@ gst_droidcamsrc_vfsrc_negotiate (GstDroidCamSrcPad * data)
   src->height = info.height;
   src->fps_n = info.fps_n;
   src->fps_d = info.fps_d;
+  src->crop_rect.left = 0;
+  src->crop_rect.top = 0;
+  src->crop_rect.right = info.width;
+  src->crop_rect.bottom = info.height;
   GST_OBJECT_UNLOCK (src);
 
   preview = g_strdup_printf ("%ix%i", info.width, info.height);
   gst_droidcamsrc_params_set_string (src->dev->params, "preview-size", preview);
   g_free (preview);
+
+  g_rec_mutex_lock (&src->dev_lock);
+  src->dev->use_raw_data = info.finfo->format == GST_VIDEO_FORMAT_NV21;
+  g_rec_mutex_unlock (&src->dev_lock);
 
   ret = TRUE;
 
@@ -1542,7 +1567,7 @@ gst_droidcamsrc_vidsrc_negotiate (GstDroidCamSrcPad * data)
   gboolean ret = FALSE;
   GstCaps *peer = NULL;
   GstCaps *our_caps = NULL;
-  gchar *vid;
+  gchar *vid, *pic;
   GstVideoInfo info;
 
   g_rec_mutex_lock (&src->dev_lock);
@@ -1603,7 +1628,17 @@ gst_droidcamsrc_vidsrc_negotiate (GstDroidCamSrcPad * data)
       src->dev->
       params->has_separate_video_size_values ? "video-size" : "preview-size";
   gst_droidcamsrc_params_set_string (src->dev->params, key, vid);
+
+  /* Now we need to find a picture size that is equal to our video size.
+   * Some devices need to have a picture size otherwise the video mode viewfinder
+   * behaves in a funny way and can be stretched or squeezed */
+  pic = gst_droidcamsrc_find_picture_resolution (src, vid);
   g_free (vid);
+
+  if (pic) {
+    gst_droidcamsrc_params_set_string (src->dev->params, "picture-size", pic);
+    g_free (pic);
+  }
 
   ret = TRUE;
 
@@ -1689,7 +1724,7 @@ gst_droidcamsrc_start_video_recording_locked (GstDroidCamSrc * src)
   }
 
   if (!gst_droidcamsrc_dev_start_video_recording (src->dev)) {
-    GST_ERROR_OBJECT (src, "failed to start image capture");
+    GST_ERROR_OBJECT (src, "failed to start video recording");
     return FALSE;
   }
 
@@ -2101,4 +2136,43 @@ gst_droidcamsrc_pick_largest_resolution (GstDroidCamSrc * src, GstCaps * caps)
   out_caps = gst_caps_copy_nth (caps, index);
   gst_caps_unref (caps);
   return out_caps;
+}
+
+static gchar *
+gst_droidcamsrc_find_picture_resolution (GstDroidCamSrc * src,
+    const gchar * resolution)
+{
+  const gchar *supported;
+  gchar **vals = NULL, **tmp;
+  gchar *ret = NULL;
+
+  GST_DEBUG_OBJECT (src, "find picture resolution for %s", resolution);
+
+  supported =
+      gst_droidcamsrc_params_get_string (src->dev->params,
+      "picture-size-values");
+
+  GST_LOG_OBJECT (src, "supported picture sizes: %s", supported);
+
+  vals = g_strsplit (supported, ",", -1);
+
+  tmp = vals;
+  while (*tmp) {
+    if (!g_strcmp0 (*tmp, resolution)) {
+      GST_DEBUG_OBJECT (src, "found resolution %s", *tmp);
+      ret = g_strdup (*tmp);
+      goto out;
+    }
+    ++tmp;
+  }
+
+out:
+  g_strfreev (vals);
+
+  if (!ret) {
+    GST_WARNING_OBJECT (src, "no picture resolution corresponding to %s",
+        resolution);
+  }
+
+  return ret;
 }

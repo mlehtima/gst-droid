@@ -32,6 +32,7 @@ typedef enum _GstDroidCamSrcApplyType GstDroidCamSrcApplyType;
 typedef enum
 {
   PROP_0,
+  PROP_DEVICE_PARAMETERS,
   PROP_CAMERA_DEVICE,
   PROP_MODE,
   PROP_READY_FOR_CAPTURE,
@@ -71,7 +72,7 @@ typedef enum
 
 void gst_droidcamsrc_photography_register (gpointer g_iface,  gpointer iface_data);
 void gst_droidcamsrc_photography_add_overrides (GObjectClass * klass);
-void gst_droidcamsrc_photography_init (GstDroidCamSrc * src);
+void gst_droidcamsrc_photography_init (GstDroidCamSrc * src, gint dev);
 void gst_droidcamsrc_photography_destroy (GstDroidCamSrc * src);
 gboolean gst_droidcamsrc_photography_get_property (GstDroidCamSrc * src, guint prop_id,
 						   GValue * value, GParamSpec * pspec);

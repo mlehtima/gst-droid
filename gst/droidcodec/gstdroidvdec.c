@@ -133,7 +133,7 @@ gst_droidvdec_create_codec (GstDroidVDec * dec, GstBuffer * input)
       DROID_MEDIA_CODEC_HW_ONLY | DROID_MEDIA_CODEC_USE_EXTERNAL_LOOP;
   md.codec_data.size = 0;
 
-  if (dec->info.finfo->format == GST_VIDEO_FORMAT_I420) {
+  if (dec->format == GST_VIDEO_FORMAT_I420) {
     md.parent.flags |= DROID_MEDIA_CODEC_NO_MEDIA_BUFFER;
   }
 
@@ -220,8 +220,8 @@ static gboolean
 gst_droidvdec_convert_buffer (GstDroidVDec * dec,
     GstBuffer * out, DroidMediaData * in, GstVideoInfo * info)
 {
-  gboolean use_external_buffer =
-      GST_VIDEO_INFO_COMP_STRIDE (info, 0) != info->width;
+  gsize size = info->width * info->height * 3 / 2;
+  gboolean use_external_buffer = gst_buffer_get_size (out) != size;
   guint8 *data = NULL;
   gboolean ret;
   GstMapInfo map_info;
@@ -238,7 +238,7 @@ gst_droidvdec_convert_buffer (GstDroidVDec * dec,
 
   if (use_external_buffer) {
     GST_DEBUG_OBJECT (dec, "using an external buffer for I420 conversion.");
-    data = g_malloc (info->width * info->height * 3 / 2);
+    data = g_malloc (size);
   } else {
     data = map_info.data;
   }
@@ -406,7 +406,7 @@ gst_droidvdec_frame_available (void *user)
 acquire_and_release:
   /* we can not use our cb struct here so ask droidmedia to do
    * the work instead */
-  droid_media_buffer_queue_acquire_and_release (dec->queue);
+  droid_media_buffer_queue_acquire_and_release (dec->queue, NULL);
   GST_VIDEO_DECODER_STREAM_UNLOCK (decoder);
 }
 
@@ -600,7 +600,7 @@ gst_droidvdec_configure_state (GstVideoDecoder * decoder, guint width,
       "codec reported state: width: %d, height: %d, crop: %d,%d %d,%d",
       md.width, md.height, rect.left, rect.top, rect.right, rect.bottom);
 
-  if (dec->info.finfo->format == GST_VIDEO_FORMAT_I420) {
+  if (dec->format == GST_VIDEO_FORMAT_I420) {
     width = rect.right - rect.left;
     height = rect.bottom - rect.top;
   }
@@ -609,7 +609,7 @@ gst_droidvdec_configure_state (GstVideoDecoder * decoder, guint width,
       height);
 
   dec->out_state = gst_video_decoder_set_output_state (decoder,
-      dec->info.finfo->format, width, height, dec->in_state);
+      dec->format, width, height, dec->in_state);
 
   /* now the caps */
   g_assert (dec->out_state->caps == NULL);
@@ -785,6 +785,7 @@ gst_droidvdec_start (GstVideoDecoder * decoder)
   dec->codec_type = NULL;
   dec->dirty = TRUE;
   dec->running = TRUE;
+  dec->format = GST_VIDEO_FORMAT_UNKNOWN;
 
   return TRUE;
 }
@@ -794,6 +795,8 @@ gst_droidvdec_set_format (GstVideoDecoder * decoder, GstVideoCodecState * state)
 {
   GstDroidVDec *dec = GST_DROIDVDEC (decoder);
   GstCaps *caps, *template_caps;
+  GstStructure *s;
+  const gchar *format;
 
   /*
    * destroying the droidmedia codec here will cause stagefright to call abort.
@@ -831,13 +834,15 @@ gst_droidvdec_set_format (GstVideoDecoder * decoder, GstVideoCodecState * state)
   caps = gst_caps_truncate (caps);
   caps = gst_caps_fixate (caps);
 
-  if (!gst_video_info_from_caps (&dec->info, caps)) {
+  s = gst_caps_get_structure (caps, 0);
+  format = gst_structure_get_string (s, "format");
+  dec->format = gst_video_format_from_string (format);
+  gst_caps_unref (caps);
+
+  if (G_UNLIKELY (format == GST_VIDEO_FORMAT_UNKNOWN)) {
     GST_ELEMENT_ERROR (dec, STREAM, FORMAT, (NULL), ("Failed to parse caps"));
-    gst_caps_unref (caps);
     return FALSE;
   }
-
-  gst_caps_unref (caps);
 
   dec->in_state = gst_video_codec_state_ref (state);
 
@@ -867,7 +872,7 @@ gst_droidvdec_finish (GstVideoDecoder * decoder)
   if (dec->state == GST_DROID_VDEC_STATE_WAITING_FOR_EOS) {
     GST_DEBUG_OBJECT (dec, "already finishing");
     g_mutex_unlock (&dec->state_lock);
-    return GST_FLOW_OK;
+    return GST_FLOW_NOT_SUPPORTED;
   }
 
   if (dec->codec && dec->state == GST_DROID_VDEC_STATE_OK) {
@@ -1073,6 +1078,7 @@ gst_droidvdec_change_state (GstElement * element, GstStateChange transition)
 
   if (transition == GST_STATE_CHANGE_PAUSED_TO_READY) {
     GstVideoDecoder *decoder = GST_VIDEO_DECODER (dec);
+    GstFlowReturn finish_res = GST_FLOW_OK;
 
     GST_VIDEO_DECODER_STREAM_LOCK (decoder);
     /*
@@ -1081,10 +1087,12 @@ gst_droidvdec_change_state (GstElement * element, GstStateChange transition)
      * gst_droidvdec_stop_loop() will deadlock
      */
     if (dec->codec) {
-      gst_droidvdec_finish (decoder);
+      finish_res = gst_droidvdec_finish (decoder);
     }
 
-    gst_droidvdec_stop_loop (dec);
+    if (finish_res != GST_FLOW_NOT_SUPPORTED) {
+      gst_droidvdec_stop_loop (dec);
+    }
 
     GST_VIDEO_DECODER_STREAM_UNLOCK (decoder);
   }

@@ -26,6 +26,7 @@
 #include <gst/gst.h>
 #include "gstdroidcamsrcparams.h"
 #include "droidmediacamera.h"
+#include "droidmediaconstants.h"
 
 G_BEGIN_DECLS
 
@@ -46,6 +47,7 @@ struct _GstDroidCamSrcDev
   GstAllocator *wrap_allocator;
   GstAllocator *media_allocator;
   gboolean running;
+  gboolean use_raw_data;
   GRecMutex *lock;
   GstDroidCamSrcCamInfo *info;
   GstDroidCamSrcImageCaptureState *img;

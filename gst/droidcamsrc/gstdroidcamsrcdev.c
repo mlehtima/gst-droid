@@ -71,6 +71,9 @@ typedef struct _GstDroidCamSrcDevVideoData
 static void gst_droidcamsrc_dev_release_recording_frame (void *data,
     GstDroidCamSrcDevVideoData * video_data);
 void gst_droidcamsrc_dev_update_params_locked (GstDroidCamSrcDev * dev);
+static void
+gst_droidcamsrc_dev_prepare_buffer (GstDroidCamSrcDev * dev, GstBuffer * buffer,
+    DroidMediaRect rect, int width, int height, GstVideoFormat format);
 
 static void
 gst_droidcamsrc_dev_shutter_callback (void *user)
@@ -261,9 +264,39 @@ gst_droidcamsrc_dev_preview_frame_callback (void *user,
 {
   GstDroidCamSrcDev *dev = (GstDroidCamSrcDev *) user;
   GstDroidCamSrc *src = GST_DROIDCAMSRC (GST_PAD_PARENT (dev->imgsrc->pad));
+  GstDroidCamSrcPad *pad = dev->vfsrc;
+  GstBuffer *buffer;
+  gsize width, height;
+  DroidMediaRect rect;
 
   GST_DEBUG_OBJECT (src, "dev preview frame callback");
-  GST_FIXME_OBJECT (src, "implement me");
+
+  /* We are accessing this without a lock because:
+   * 1) We should not be called while preview is stopped and this is when we manipulate this flag
+   * 2) We can get called when we start the preview and we will deadlock because the lock is already held
+   */
+  if (!dev->use_raw_data) {
+    GST_WARNING_OBJECT (src,
+        "preview frame callback called while not when we do not expect it");
+    return;
+  }
+
+  buffer = gst_buffer_new_allocate (NULL, mem->size, NULL);
+  gst_buffer_fill (buffer, 0, mem->data, mem->size);
+
+  GST_OBJECT_LOCK (src);
+  width = src->width;
+  height = src->height;
+  rect = src->crop_rect;
+  GST_OBJECT_UNLOCK (src);
+
+  gst_droidcamsrc_dev_prepare_buffer (dev, buffer, rect, width, height,
+      GST_VIDEO_FORMAT_NV21);
+
+  g_mutex_lock (&pad->lock);
+  g_queue_push_tail (pad->queue, buffer);
+  g_cond_signal (&pad->cond);
+  g_mutex_unlock (&pad->lock);
 }
 
 static void
@@ -307,13 +340,10 @@ gst_droidcamsrc_dev_video_frame_callback (void *user,
   gst_droidcamsrc_timestamp (src, buffer);
 
   g_rec_mutex_lock (dev->lock);
+  ++dev->vid->queued_frames;
+  g_rec_mutex_unlock (dev->lock);
 
   drop_buffer = !dev->vid->running;
-  if (!drop_buffer) {
-    ++dev->vid->queued_frames;
-  }
-
-  g_rec_mutex_unlock (dev->lock);
 
   if (drop_buffer) {
     GST_INFO_OBJECT (src,
@@ -409,18 +439,26 @@ gst_droidcamsrc_dev_frame_available (void *user)
   GstDroidCamSrcPad *pad = dev->vfsrc;
   DroidMediaBuffer *buffer;
   GstMemory *mem;
-  GstVideoCropMeta *crop_meta;
   DroidMediaRect rect;
   guint width, height;
   GstBuffer *buff;
   DroidMediaBufferCallbacks cb;
   GstFlowReturn flow_ret;
+  DroidMediaBufferInfo info;
 
   GST_DEBUG_OBJECT (src, "frame available");
 
   if (!pad->running) {
     GST_DEBUG_OBJECT (src, "vfsrc pad task is not running");
 
+    goto acquire_and_release;
+  }
+
+  /* We are accessing this without a lock because:
+   * 1) We should not be called while preview is stopped and this is when we manipulate this flag
+   * 2) We can get called when we start the preview and we will deadlock because the lock is already held
+   */
+  if (dev->use_raw_data) {
     goto acquire_and_release;
   }
 
@@ -451,37 +489,28 @@ gst_droidcamsrc_dev_frame_available (void *user)
   gst_droidcamsrc_timestamp (src, buff);
 
   rect = droid_media_buffer_get_crop_rect (buffer);
-  crop_meta = gst_buffer_add_video_crop_meta (buff);
-  crop_meta->x = rect.left;
-  crop_meta->y = rect.top;
-  crop_meta->width = rect.right - rect.left;
-  crop_meta->height = rect.bottom - rect.top;
-
-  gst_buffer_add_gst_buffer_orientation_meta (buff,
-      dev->info->orientation, dev->info->direction);
-
   width = droid_media_buffer_get_width (buffer);
   height = droid_media_buffer_get_height (buffer);
 
-  gst_buffer_add_video_meta (buff, GST_VIDEO_FRAME_FLAG_NONE,
-      GST_VIDEO_FORMAT_YV12, width, height);
-
-  GST_LOG_OBJECT (src, "preview info: w=%d, h=%d, crop: x=%d, y=%d, w=%d, h=%d",
-      width, height, crop_meta->x, crop_meta->y, crop_meta->width,
-      crop_meta->height);
+  gst_droidcamsrc_dev_prepare_buffer (dev, buff, rect, width, height,
+      GST_VIDEO_FORMAT_YV12);
 
   g_mutex_lock (&pad->lock);
-
   g_queue_push_tail (pad->queue, buff);
-
   g_cond_signal (&pad->cond);
-
   g_mutex_unlock (&pad->lock);
 
+  GST_OBJECT_LOCK (src);
+  src->crop_rect = rect;
+  GST_OBJECT_UNLOCK (src);
   return;
 
 acquire_and_release:
-  droid_media_buffer_queue_acquire_and_release (dev->queue);
+  if (droid_media_buffer_queue_acquire_and_release (dev->queue, &info)) {
+    GST_OBJECT_LOCK (src);
+    src->crop_rect = info.crop_rect;
+    GST_OBJECT_UNLOCK (src);
+  }
 }
 
 GstDroidCamSrcDev *
@@ -496,6 +525,7 @@ gst_droidcamsrc_dev_new (GstDroidCamSrcPad * vfsrc,
   dev->cam = NULL;
   dev->queue = NULL;
   dev->running = FALSE;
+  dev->use_raw_data = FALSE;
   dev->info = NULL;
   dev->img = g_slice_new0 (GstDroidCamSrcImageCaptureState);
   dev->vid = g_slice_new0 (GstDroidCamSrcVideoCaptureState);
@@ -697,9 +727,16 @@ gst_droidcamsrc_dev_start (GstDroidCamSrcDev * dev, gboolean apply_settings)
     goto out;
   }
 
-  /* We don't want the preview frame. We will render it using the GraphicBuffers we get */
-  droid_media_camera_set_preview_callback_flags (dev->cam,
-      dev->c.CAMERA_FRAME_CALLBACK_FLAG_NOOP);
+  if (dev->use_raw_data) {
+    GST_INFO_OBJECT (src, "Using raw data mode");
+    droid_media_camera_set_preview_callback_flags (dev->cam,
+        dev->c.CAMERA_FRAME_CALLBACK_FLAG_CAMERA);
+  } else {
+    GST_INFO_OBJECT (src, "Using native buffers mode");
+    droid_media_camera_set_preview_callback_flags (dev->cam,
+        dev->c.CAMERA_FRAME_CALLBACK_FLAG_NOOP);
+  }
+
   if (!droid_media_camera_start_preview (dev->cam)) {
     GST_ERROR_OBJECT (src, "error starting preview");
     goto out;
@@ -732,6 +769,12 @@ gst_droidcamsrc_dev_stop (GstDroidCamSrcDev * dev)
     dev->running = FALSE;
     GST_DEBUG ("stopped preview");
   }
+
+  /* Now we need to empty the queue */
+  g_mutex_lock (&dev->vfsrc->lock);
+  g_queue_foreach (dev->vfsrc->queue, (GFunc) gst_buffer_unref, NULL);
+  g_queue_clear (dev->vfsrc->queue);
+  g_mutex_unlock (&dev->vfsrc->lock);
 
   g_rec_mutex_unlock (dev->lock);
 }
@@ -807,6 +850,7 @@ out:
 gboolean
 gst_droidcamsrc_dev_start_video_recording (GstDroidCamSrcDev * dev)
 {
+  GstDroidCamSrc *src = GST_DROIDCAMSRC (GST_PAD_PARENT (dev->imgsrc->pad));
   gboolean ret = FALSE;
 
   GST_DEBUG ("dev start video recording");
@@ -818,13 +862,20 @@ gst_droidcamsrc_dev_start_video_recording (GstDroidCamSrcDev * dev)
   g_mutex_unlock (&dev->vidsrc->lock);
 
   g_rec_mutex_lock (dev->lock);
+  if (dev->use_raw_data) {
+    GST_ELEMENT_ERROR (src, STREAM, FORMAT, ("Cannot record video in raw mode"),
+        (NULL));
+    goto out;
+  }
+
   dev->vid->running = TRUE;
   dev->vid->eos_sent = FALSE;
   dev->vid->video_frames = 0;
   dev->vid->queued_frames = 0;
 
   if (!droid_media_camera_start_recording (dev->cam)) {
-    GST_ERROR ("error starting video recording");
+    GST_ELEMENT_ERROR (src, LIBRARY, FAILED, ("error starting video recording"),
+        (NULL));
     goto out;
   }
 
@@ -864,6 +915,7 @@ gst_droidcamsrc_dev_stop_video_recording (GstDroidCamSrcDev * dev)
   /* our pad task is either sleeping or still pushing buffers. We empty the queue. */
   g_mutex_lock (&dev->vidsrc->lock);
   g_queue_foreach (dev->vidsrc->queue, (GFunc) gst_buffer_unref, NULL);
+  g_queue_clear (dev->vidsrc->queue);
   g_mutex_unlock (&dev->vidsrc->lock);
 
   /* now we are done. We just push eos */
@@ -876,16 +928,12 @@ gst_droidcamsrc_dev_stop_video_recording (GstDroidCamSrcDev * dev)
 
   GST_INFO ("waiting for queued frames %i", dev->vid->queued_frames);
 
-  if (dev->vid->queued_frames > 0) {
+  while (dev->vid->queued_frames > 0) {
     GST_INFO ("waiting for queued frames to reach 0 from %i",
         dev->vid->queued_frames);
     g_rec_mutex_unlock (dev->lock);
     usleep (VIDEO_RECORDING_STOP_TIMEOUT);
     g_rec_mutex_lock (dev->lock);
-  }
-
-  if (dev->vid->queued_frames > 0) {
-    GST_WARNING ("video queue still has %i frames", dev->vid->queued_frames);
   }
 
   g_rec_mutex_unlock (dev->lock);
@@ -1048,4 +1096,31 @@ gst_droidcamsrc_dev_is_running (GstDroidCamSrcDev * dev)
   g_rec_mutex_unlock (dev->lock);
 
   return ret;
+}
+
+static void
+gst_droidcamsrc_dev_prepare_buffer (GstDroidCamSrcDev * dev, GstBuffer * buffer,
+    DroidMediaRect rect, int width, int height, GstVideoFormat format)
+{
+  GstDroidCamSrc *src = GST_DROIDCAMSRC (GST_PAD_PARENT (dev->imgsrc->pad));
+  GstVideoCropMeta *crop;
+
+  GST_LOG_OBJECT (src, "prepare buffer %" GST_PTR_FORMAT, buffer);
+
+  gst_droidcamsrc_timestamp (src, buffer);
+
+  crop = gst_buffer_add_video_crop_meta (buffer);
+  crop->x = rect.left;
+  crop->y = rect.top;
+  crop->width = rect.right - rect.left;
+  crop->height = rect.bottom - rect.top;
+
+  gst_buffer_add_gst_buffer_orientation_meta (buffer,
+      dev->info->orientation, dev->info->direction);
+
+  gst_buffer_add_video_meta (buffer, GST_VIDEO_FRAME_FLAG_NONE,
+      format, width, height);
+
+  GST_LOG_OBJECT (src, "preview info: w=%d, h=%d, crop: x=%d, y=%d, w=%d, h=%d",
+      width, height, crop->x, crop->y, crop->width, crop->height);
 }
